@@ -83,7 +83,7 @@ class SearchResult:
 
 
 # ============================================================
-# Text- und Metadaten-Helfer
+# Hilfsfunktionen
 # ============================================================
 
 def clean_text(text: Any) -> str:
@@ -101,6 +101,7 @@ def clean_title(title: str) -> str:
 
     for part in re.split(r";+", title):
         part = part.strip()
+
         if part and part not in seen:
             seen.add(part)
             parts.append(part)
@@ -129,6 +130,7 @@ def all_values(meta: dict, key: str) -> str:
 
         for v in value:
             v = clean_text(v)
+
             if v and v not in seen:
                 seen.add(v)
                 cleaned.append(v)
@@ -149,7 +151,6 @@ def safe_date(dates: dict, key: str) -> str:
 
     value = str(value or "")
 
-    # Format aus 2025-09-10T02:00:00.000Z wird 2025-09-10
     if "T" in value:
         value = value.split("T")[0]
 
@@ -171,7 +172,11 @@ def pdf_url_from_original(original_url: str) -> str:
 
 def extract_business_number(title: str) -> str:
     match = re.search(r"\b[A-Z]-?\d{1,5}/\d{4}\b", title or "")
-    return match.group(0) if match else ""
+
+    if match:
+        return match.group(0)
+
+    return ""
 
 
 def make_doc_id(doc: dict) -> str:
@@ -191,15 +196,18 @@ def make_doc_id(doc: dict) -> str:
 # ============================================================
 
 def extract_pdf_text(pdf_url: str) -> PdfResult:
+
     if not pdf_url:
         return PdfResult("", "Keine PDF-URL", "")
 
     try:
+
         r = requests.get(
             pdf_url,
             headers={"user-agent": "Mozilla/5.0"},
             timeout=REQUEST_TIMEOUT,
         )
+
         r.raise_for_status()
 
         content_type = r.headers.get("content-type", "").lower()
@@ -214,10 +222,24 @@ def extract_pdf_text(pdf_url: str) -> PdfResult:
         pdf = fitz.open(stream=BytesIO(r.content), filetype="pdf")
 
         pages = []
+
         for page in pdf:
             pages.append(page.get_text())
 
         text = "\n".join(pages).strip()
+
+        # OCR-/Spacing-Probleme bereinigen
+        text = re.sub(r"\s+", " ", text)
+
+        # kaputte Leerzeichen zwischen Buchstaben reduzieren
+        text = re.sub(
+            r"([A-Za-zÄÖÜäöü])\s([A-Za-zÄÖÜäöü])",
+            r"\1\2",
+            text,
+        )
+
+        # Punkte normalisieren
+        text = text.replace(" .", ".")
 
         if not text:
             return PdfResult("", "PDF ohne extrahierbaren Text", "")
@@ -229,34 +251,43 @@ def extract_pdf_text(pdf_url: str) -> PdfResult:
 
 
 # ============================================================
-# Relevanz-Scoring
+# Relevanzranking
 # ============================================================
 
 def relevance_score(doc: dict, query: str) -> float:
+
     meta = doc.get("metadataKeywordTextMap", {})
 
     title = clean_title(first(meta, "title")).lower()
     snippet = clean_text(doc.get("content", "")).lower()
+
     text = f"{title} {snippet}"
 
     query_lower = query.lower().strip()
-    words = [w.strip() for w in re.split(r"\s+", query_lower) if len(w.strip()) > 2]
+
+    words = [
+        w.strip()
+        for w in re.split(r"\s+", query_lower)
+        if len(w.strip()) > 2
+    ]
 
     score = 0.0
 
-    # Exakte Phrase ist besonders stark
+    # exakte Phrase
     if query_lower and query_lower in text:
         score += 100
 
-    # Einzelwörter zählen
+    # einzelne Suchwörter
     for word in words:
+
         count = text.count(word)
+
         score += count * 10
 
         if word in title:
             score += 30
 
-    # Bonus, wenn mehrere Suchwörter gemeinsam vorkommen
+    # mehrere Suchwörter gemeinsam vorhanden
     matched_words = sum(1 for word in words if word in text)
 
     if words:
@@ -267,7 +298,7 @@ def relevance_score(doc: dict, query: str) -> float:
     if "bvge" in title:
         score += 50
 
-    # Bonus für längere Suchauszüge
+    # Bonus für längere Snippets
     score += min(len(snippet) / 100, 40)
 
     return round(score, 2)
@@ -293,6 +324,7 @@ def build_payload(query: str, offset: int, size: int) -> dict:
 
 
 def search_bvger_api(query: str, max_hits: int) -> SearchResult:
+
     docs = []
     seen = set()
 
@@ -301,9 +333,11 @@ def search_bvger_api(query: str, max_hits: int) -> SearchResult:
     last_error = ""
 
     while len(docs) < max_hits:
+
         payload = build_payload(query, offset, PAGE_SIZE)
 
         try:
+
             r = requests.post(
                 API_URL,
                 headers=HEADERS,
@@ -316,6 +350,7 @@ def search_bvger_api(query: str, max_hits: int) -> SearchResult:
                 break
 
             data = r.json()
+
             batch = data.get("documents", [])
 
             if not batch:
@@ -324,6 +359,7 @@ def search_bvger_api(query: str, max_hits: int) -> SearchResult:
             new_count = 0
 
             for doc in batch:
+
                 doc_id = make_doc_id(doc)
 
                 if doc_id and doc_id not in seen:
@@ -343,6 +379,7 @@ def search_bvger_api(query: str, max_hits: int) -> SearchResult:
                 break
 
             offset += PAGE_SIZE
+
             sleep(SLEEP_BETWEEN_REQUESTS)
 
         except Exception as e:
@@ -362,33 +399,26 @@ def search_bvger_api(query: str, max_hits: int) -> SearchResult:
 
 
 def search_bvger(query: str, max_hits: int) -> SearchResult:
-    """
-    Zentrale Suchfunktion.
-
-    Aktuell:
-    - Weblaw/BVGer-API
-
-    Später möglich:
-    - HTML-/Jurispub-Fallback
-    - direkte Geschäftsnummernsuche
-    - lokaler Cache
-    """
     return search_bvger_api(query, max_hits)
 
 
 # ============================================================
-# Dokument in CSV-Zeile umwandeln
+# Dokument -> CSV-Zeile
 # ============================================================
 
 def doc_to_row(doc: dict, search_query: str, load_fulltext: bool) -> dict:
+
     meta = doc.get("metadataKeywordTextMap", {})
     dates = doc.get("metadataDateMap", {})
 
     raw_title = first(meta, "title")
+
     title = clean_title(raw_title)
+
     date = safe_date(dates, "rulingDate")
 
     original_url = first(meta, "originalUrl")
+
     pdf_url = pdf_url_from_original(original_url)
 
     snippet = clean_text(doc.get("content", ""))
@@ -431,13 +461,12 @@ def doc_to_row(doc: dict, search_query: str, load_fulltext: bool) -> dict:
 
 
 # ============================================================
-# Streamlit UI
+# UI
 # ============================================================
 
 query_text = st.text_area(
     "Suchbegriff / Thema",
     value="Türkei Politmalus",
-    help="Mehrere Suchbegriffe untereinander eingeben. Jede Zeile wird separat gesucht.",
     height=140,
 )
 
@@ -454,7 +483,7 @@ with col1:
 
 with col2:
     max_fulltexts_total = st.number_input(
-        "Maximale PDF-Volltexte insgesamt",
+        "Maximale PDF-Volltexte",
         min_value=0,
         max_value=500,
         value=100,
@@ -469,16 +498,12 @@ with col3:
         value=10,
     )
 
-with st.expander("Optionen"):
-    show_only_loaded = st.checkbox(
-        "In der Vorschau nur Urteile mit geladenem Volltext zeigen",
-        value=False,
-    )
-
+with st.expander("Info"):
     st.write(
         """
-        Die App sammelt zuerst Treffer, berechnet dann einen Relevanz-Score
-        und lädt anschließend die PDF-Volltexte der besten Treffer zuerst.
+        Die Treffer werden zuerst gesammelt,
+        danach nach Relevanz sortiert,
+        anschließend werden die wichtigsten PDFs zuerst geladen.
         """
     )
 
@@ -503,10 +528,11 @@ if st.button("Recherche starten und CSV erstellen", type="primary"):
     status = st.empty()
 
     # --------------------------------------------------------
-    # 1. Suche
+    # Suche
     # --------------------------------------------------------
 
     for idx, q in enumerate(queries, start=1):
+
         status.write(f"Suche {idx}/{len(queries)}: {q}")
 
         result = search_bvger(q, int(max_hits_per_query))
@@ -521,6 +547,7 @@ if st.button("Recherche starten und CSV erstellen", type="primary"):
         )
 
         for doc in result.docs:
+
             doc_id = make_doc_id(doc)
 
             if doc_id and doc_id not in global_seen:
@@ -532,21 +559,26 @@ if st.button("Recherche starten und CSV erstellen", type="primary"):
     st.success(f"{len(all_docs)} eindeutige Urteile gefunden.")
 
     st.subheader("Suchprotokoll")
-    log_df = pd.DataFrame(search_log)
-    st.dataframe(log_df, use_container_width=True)
+
+    st.dataframe(
+        pd.DataFrame(search_log),
+        use_container_width=True,
+    )
 
     if not all_docs:
-        st.warning("Keine verwertbaren Treffer gefunden.")
+        st.warning("Keine Treffer gefunden.")
         st.stop()
 
     # --------------------------------------------------------
-    # 2. Relevanzranking vor PDF-Download
+    # Relevanzranking
     # --------------------------------------------------------
 
     ranked_docs = []
 
     for doc, q in all_docs:
+
         score = relevance_score(doc, q)
+
         ranked_docs.append((score, doc, q))
 
     ranked_docs.sort(reverse=True, key=lambda x: x[0])
@@ -554,13 +586,18 @@ if st.button("Recherche starten und CSV erstellen", type="primary"):
     all_docs = [(doc, q) for score, doc, q in ranked_docs]
 
     st.info(
-        "Treffer wurden nach inhaltlicher Relevanz sortiert. "
-        "Die besten Treffer werden zuerst als Volltext geladen."
+        "Treffer wurden nach Relevanz sortiert. "
+        "Die stärksten Treffer werden zuerst als Volltext geladen."
     )
+
+    # --------------------------------------------------------
+    # Ranking-Vorschau
+    # --------------------------------------------------------
 
     ranking_preview = []
 
     for score, doc, q in ranked_docs[:20]:
+
         meta = doc.get("metadataKeywordTextMap", {})
         dates = doc.get("metadataDateMap", {})
 
@@ -570,18 +607,22 @@ if st.button("Recherche starten und CSV erstellen", type="primary"):
                 "Titel": clean_title(first(meta, "title")),
                 "Datum": safe_date(dates, "rulingDate"),
                 "Suchbegriff": q,
-                "PDF": pdf_url_from_original(first(meta, "originalUrl")),
             }
         )
 
-    st.subheader("Top-Ranking vor PDF-Download")
-    st.dataframe(pd.DataFrame(ranking_preview), use_container_width=True)
+    st.subheader("Top-Ranking")
+
+    st.dataframe(
+        pd.DataFrame(ranking_preview),
+        use_container_width=True,
+    )
 
     # --------------------------------------------------------
-    # 3. PDF-Volltexte laden
+    # PDF-Extraktion
     # --------------------------------------------------------
 
     rows = []
+
     fulltext_attempts = 0
     fulltext_ok = 0
 
@@ -589,10 +630,13 @@ if st.button("Recherche starten und CSV erstellen", type="primary"):
     pdf_status = st.empty()
 
     for i, (doc, q) in enumerate(all_docs, start=1):
+
         load_fulltext = fulltext_attempts < int(max_fulltexts_total)
 
         if load_fulltext:
+
             meta = doc.get("metadataKeywordTextMap", {})
+
             title = clean_title(first(meta, "title"))
 
             pdf_status.write(
@@ -610,17 +654,24 @@ if st.button("Recherche starten und CSV erstellen", type="primary"):
 
         progress_pdf.progress(i / len(all_docs))
 
+    # --------------------------------------------------------
+    # DataFrame
+    # --------------------------------------------------------
+
     df = pd.DataFrame(rows)
 
-    # Nach Score sortiert lassen
-    df = df.sort_values(by="Relevanz_Score", ascending=False).reset_index(drop=True)
+    df = df.sort_values(
+        by="Relevanz_Score",
+        ascending=False,
+    ).reset_index(drop=True)
 
     # --------------------------------------------------------
-    # 4. Resultate anzeigen und CSV exportieren
+    # Export
     # --------------------------------------------------------
 
     st.success(f"{len(df)} Urteile verarbeitet.")
-    st.info(f"{fulltext_ok} PDF-Volltexte erfolgreich extrahiert.")
+
+    st.info(f"{fulltext_ok} Volltexte erfolgreich extrahiert.")
 
     csv = df.to_csv(index=False).encode("utf-8-sig")
 
@@ -631,18 +682,24 @@ if st.button("Recherche starten und CSV erstellen", type="primary"):
         mime="text/csv",
     )
 
+    # --------------------------------------------------------
+    # Resultate
+    # --------------------------------------------------------
+
     st.subheader("Resultate")
+
     st.dataframe(df, use_container_width=True)
+
+    # --------------------------------------------------------
+    # Vorschau
+    # --------------------------------------------------------
 
     st.subheader("Vorschau")
 
-    preview_df = df.copy()
+    for idx, row in df.head(preview_count).iterrows():
 
-    if show_only_loaded:
-        preview_df = preview_df[preview_df["Volltext_Status"] == "OK"]
-
-    for idx, row in preview_df.head(preview_count).iterrows():
         st.markdown(f"### {row['Titel']}")
+
         st.write("Relevanz-Score:", row["Relevanz_Score"])
         st.write("Datum:", row["Datum"])
         st.write("Geschäftsnummer:", row["Geschäftsnummer"])
